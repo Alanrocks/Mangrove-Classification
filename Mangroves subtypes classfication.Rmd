@@ -1,0 +1,239 @@
+---
+title: "Mangrove Classification in Madagascar"
+author: "JiaYu Wu"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  pdf_document: 
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!dir.exists("outputs")) dir.create("outputs", showWarnings = FALSE)
+```
+
+The R code to analyze the Classification Reference Areas(CRAs) that I have delineated, split the data into training and validation sets, classify the image with the Maximum Likelihood algorithm/Random Forest and generate the confusion matrix. 
+
+
+```{r, message=FALSE}
+#Install necessary packages
+library(tidyverse)
+library(terra)
+library(sf)
+library(RStoolbox)
+library(raster)
+
+```
+
+
+```{r}
+#Load the base map of planet data for classification
+setwd()
+ls_image <- rast()#Link to the tif file
+
+ls_image
+terra::plotRGB(ls_image, r = 3, g = 2, b = 1, stretch = "lin")
+names(ls_image)<-c("G","B","R","NIR") #There are 4 bands, change it to the right band name
+```
+
+Then, we load the delineated polygons
+
+
+
+Here is a summary of the number of polygons per class
+
+```{r}
+my_polygons <- #Link to the CRAs shapefile
+
+class_poly <- st_read(my_polygons)
+# Make sure that the geometry is valid
+class_poly <- st_make_valid(class_poly)
+
+#reproject
+class_poly<-st_transform(class_poly,st_crs(ls_image))
+
+terra::plotRGB(ls_image, r = 3, g = 2, b = 1, stretch = "lin")
+plot(class_poly[, "MC_name"], add = TRUE)
+
+poly_summary <- class_poly %>%
+  st_drop_geometry() %>%
+  group_by(MC_ID) %>%
+  summarize(n_poly = n())
+
+poly_summary
+
+# Assign a unique ID to each polygon 
+set.seed(1234)
+
+# For each land cover class will use 70% of the polygons to train the classification algorithm and the remaining 30% for validation. 
+poly_train <- class_poly %>%
+  group_by(MC_ID) %>%
+  sample_frac(0.7) %>%
+  mutate(set = "training") %>% st_cast(to = 'POLYGON')
+
+# Use the ID field to select the polygons for validation
+poly_val <- class_poly %>%
+  group_by(MC_ID) %>%
+  filter(!C_ID %in% poly_train$C_ID) %>%
+  mutate(set = "validation") %>% st_cast(to = 'POLYGON')
+
+poly_set <- rbind(poly_train, 
+                  poly_val)
+#We now extract the values of the PlanetScope image pixels in the polygons
+poly_set_vals <- terra::extract(ls_image, vect(poly_set))
+# We need to perform an inner_join to retrieve lc_class
+poly_set_vals <- inner_join(poly_set, poly_set_vals,by=c("C_ID"="ID")) %>%
+  st_drop_geometry()
+poly_set_vals
+```
+
+
+
+We can check the number of pixels per class and training / validation set
+
+```{r}
+poly_stats <- poly_set_vals %>%
+  group_by(set, MC_ID) %>%
+  summarize(n_px = n())
+
+poly_stats
+
+poly_set_vals<-drop_na(poly_set_vals)
+poly_train<-drop_na(poly_train)
+poly_val<-drop_na(poly_val)
+```
+
+We can pivot the data from a wide to long format 
+
+```{r}
+poly_set_vals_long <- pivot_longer(poly_set_vals, G:NIR,
+                                   names_to = "band",values_to='reflectance')
+poly_set_vals_long
+```
+
+And calculate some summary statistics for each band and land cover class: mean, 5^th^ quantile, 95^th^ quantile, maximum, and standard Derivation of reflectance. 
+
+```{r}
+spectral_sign <- poly_set_vals_long %>%
+  group_by(MC_ID, band) %>%
+  summarize(r_mean = mean(reflectance, na.rm = TRUE), 
+      r_q05 = quantile(reflectance, 0.05, na.rm = TRUE), 
+      r_q95 = quantile(reflectance, 0.95, na.rm = TRUE),
+      max=max(reflectance),
+            sd = sd(reflectance, na.rm = TRUE))
+
+spectral_sign
+```
+
+We can now visualize the spectral signature of each land cover class
+
+```{r}
+# Wavelength corresponding to each band
+bands_wavelength <- read_csv("bands_wavelength.csv")
+
+bands_wavelength
+
+# Join wavelength
+spectral_sign <- inner_join(spectral_sign, bands_wavelength)
+
+# Graph
+ggplot(spectral_sign, aes(x = wavelength, y = r_mean, group = 1)) +
+  geom_point() + 
+  geom_line() + 
+  geom_ribbon(aes(ymin = r_q05, ymax = r_q95), alpha = 0.2) + 
+  facet_wrap(vars(MC_ID)) + 
+  theme_bw() + 
+  labs(x = "Wavelength (nm)", 
+       y = "Reflectance")
+
+```
+
+We can now use the function `superClass()` from the `RSToolbox` package to perform the classification and accuracy assessment. The argument `model = "mlc"` is used to select the Maximum Likelihood algorithm for classification. We provide the polygons used for training and validation under the arguments `trainData` and `valData`. The function will sample `500` pixels from the training polygons (argument `nSamples = 500`) per land cover class and use this sample to train the classification algorithm. Similarly, validation will be performed on a sample of `500` pixels of the validation polygons per land cover class. 
+
+```{r}
+set.seed(1234)
+
+poly_train <- poly_train %>% rename(class = MC_ID)
+poly_val <- poly_val %>% rename( class=MC_ID )
+
+mlc_model <- superClass(img = ls_image, 
+                        trainData = as(poly_train,"Spatial"), 
+                        valData = as(poly_val,"Spatial"), 
+                        responseCol = "class", 
+                        model = "mlc", 
+                        nSamples = 500,verbose=TRUE)
+```
+The `superClass()` function returns a list with multiple objects. The classified map is stored in the element of the list called `map`.  The trained model is stored in the element `model`. The predictions of the model at the validation data are stored in a data.frame called `validationSamples` located in the element of `mlc_model` called `validation`. The column `reference` is the land cover class that you have assigned and the column `prediction` is the land cover class predicted by the model. 
+   ```
+
+```{r}
+classified_map <- mlc_model$map
+
+# Write the classified map as a tif file
+setwd()
+raster::writeRaster(classified_map, 
+            filename = "xxx.TIF", 
+            overwrite = TRUE)
+
+# Plot with colors
+raster::plot(classified_map,
+     col = c('#A6D96A','#33A02C','#DE3B13','blue','#00D2D2','#F1A026','#2B83BA','#B1A026','#F116AE'))
+
+# Validation df
+val_preds <- mlc_model$validation$validationSamples
+
+head(val_preds)
+```
+
+The confusion matrix can be created from `val_preds` using the `table()` function (base R package). The columns represent the reference classes (classes you have assigned) and the rows represent the predictions of the model. 
+
+```{r}
+conf_matrix <- table(st_drop_geometry(val_preds[, c("prediction", "reference")]))
+knitr::kable(conf_matrix)
+```
+
+The `table()` function returns a `matrix` object with the predicted classes in the rows and the reference classes in the columns. The diagonal of a matrix can be returned as a `vector` using the `diag()` function. The row and column sums can be returned with the `rowSums()` and `colSums()` functions. The sum of all elements of a matrix can be obtained with the `sum()` function. 
+
+Use the functions described above to calculate the overall accuracy (`OA`), producer accuracy (`PA`) and user accuracy (`UA`) of your classification. 
+
+### Code answer {#code-answer}
+
+```{r}
+#Overall accuracy
+OA<-sum(diag(conf_matrix))/sum(conf_matrix)
+message("The overall accuracy is ", scales::percent(OA))
+#Producer accuracy
+PA_Forest<-diag(conf_matrix)[1]/colSums(conf_matrix)[1]
+PA_Dry<-conf_matrix[2,2]/colSums(conf_matrix)[2]
+PA_Exposed<-conf_matrix[3,3]/colSums(conf_matrix)[3]
+PA_water<-conf_matrix[4,4]/colSums(conf_matrix)[4]
+PA_closed_mangrove<-conf_matrix[5,5]/colSums(conf_matrix)[5]
+PA_open_mangrove_I<-conf_matrix[6,6]/colSums(conf_matrix)[6]
+PA_open_mangrove_II<-conf_matrix[7,7]/colSums(conf_matrix)[7]
+PA_healthy<-conf_matrix[8,8]/colSums(conf_matrix)[8]
+PA_wet_urban<-conf_matrix[9,9]/colSums(conf_matrix)[9]
+
+
+names<-c("Terrestrial Forest","Mixed Vegetation - Dry","Barren / Exposed","Residual Water","Closed-Canopy Mangrove","Open-Canopy Mangrove I","Open-Canopy Mangrove II","Mixed Vegetation - Healthy","Mixed Vegetation - Wet/Urban")
+PA_set<-c(PA_Forest,PA_Dry,PA_Exposed,PA_water,PA_closed_mangrove,PA_open_mangrove_I,PA_open_mangrove_II,PA_healthy,PA_wet_urban)
+PA<-data.frame(names=names,value=scales::percent(PA_set))
+PA
+#User accuracy
+UA_Forest<-diag(conf_matrix)[1]/rowSums(conf_matrix)[1]
+UA_Dry<-conf_matrix[2,2]/rowSums(conf_matrix)[2]
+UA_Exposed<-conf_matrix[3,3]/rowSums(conf_matrix)[3]
+UA_water<-conf_matrix[4,4]/rowSums(conf_matrix)[4]
+UA_closed_mangrove<-conf_matrix[5,5]/rowSums(conf_matrix)[5]
+UA_open_mangrove_I<-conf_matrix[6,6]/rowSums(conf_matrix)[6]
+UA_open_mangrove_II<-conf_matrix[7,7]/rowSums(conf_matrix)[7]
+UA_healthy<-conf_matrix[8,8]/rowSums(conf_matrix)[8]
+UA_wet_urban<-conf_matrix[9,9]/rowSums(conf_matrix)[9]
+
+UA_set<-c(UA_Forest,UA_Dry,UA_Exposed,UA_water,UA_closed_mangrove,UA_open_mangrove_I,UA_open_mangrove_II,UA_healthy,UA_wet_urban)
+UA<-data.frame(names=names,value=scales::percent(UA_set))
+UA
+```
+
+End of file
