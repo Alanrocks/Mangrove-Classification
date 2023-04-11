@@ -196,9 +196,6 @@ knitr::kable(conf_matrix)
 
 The `table()` function returns a `matrix` object with the predicted classes in the rows and the reference classes in the columns. The diagonal of a matrix can be returned as a `vector` using the `diag()` function. The row and column sums can be returned with the `rowSums()` and `colSums()` functions. The sum of all elements of a matrix can be obtained with the `sum()` function. 
 
-Use the functions described above to calculate the overall accuracy (`OA`), producer accuracy (`PA`) and user accuracy (`UA`) of your classification. 
-
-### Code answer {#code-answer}
 
 ```{r}
 #Overall accuracy
